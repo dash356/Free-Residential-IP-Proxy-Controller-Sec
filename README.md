@@ -40,6 +40,36 @@ https://github.com/a6216abcd/K-UI/tree/dev
 
 本项目资源完全免费，均免费来自于互联网整合而成，如果有人问你收费，你肯定是上当受骗了！！！
 
+# 🛡️ 安全加固版说明
+
+本分支是 [a6216abcd/Free-Residential-IP-Proxy-Controller](https://github.com/a6216abcd/Free-Residential-IP-Proxy-Controller) 的安全加固 fork，修复了原版中发现的多项网络安全问题。功能与原版保持一致。
+
+## 已修复的安全问题
+
+| # | 问题 | 修复方式 |
+|---|------|----------|
+| 1 | `/scripts/*.py`、`/agent` 无鉴权，且下发代码硬编码全部口令 → 任意人可下载脚本拿到面板/代理账号 | 统一鉴权门覆盖所有敏感路由；口令移出下发代码，改为 VPS 本机 `c2.json`（600 权限） |
+| 2 | 弱默认口令（`admin/admin888`）写死在仓库和代码里 | 未配置强口令（≥12 位、非常见弱口令）时 Worker 直接拒绝服务（fail-closed） |
+| 3 | 以 root 身份执行未经消毒的第三方 VPNGate `.ovpn`（`--route-nopull` 挡不住配置文件内手写的 `redirect-gateway`/`route`/`dhcp-option`/`up` 等指令） | 下发前做指令黑名单过滤，含危险指令的节点直接拒收并拉黑 24h |
+| 4 | Socks5/HTTP 代理全程明文，Basic 认证可被嗅探 | （架构级）代理仍为明文协议——**务必用防火墙限制代理端口来源 IP，或在 VPS 前加 stunnel/TLS**；代码侧新增连接数上限（200）与空闲超时（300s）防 DoS |
+| 5 | 面板 `innerHTML` 直接拼接服务端数据 → 存储型 XSS | 全局 `esc()` 转义；响应附加 CSP / `X-Frame-Options: DENY` / `nosniff` 防点击劫持 |
+| 6 | 无任何暴力破解防护 | 鉴权失败计数限流（1 分钟 10 次失败封 5 分钟）；口令比较改用常量时间比较；含冒号口令可正常使用 |
+| 7 | 住宅 IP 质检查的是 VPN **服务器** IP，而非隧道真实出口 IP | 改为先经隧道获取真实出口 IP 再鉴定 |
+| 8 | 代理目标域名的 DNS 解析走 VPS 本机，暴露访问目标 | DNS 查询经隧道内 UDP 直连 8.8.8.8（`SO_BINDTODEVICE`），失败回退系统解析 |
+
+## 部署后必做
+
+1. 在 Cloudflare 控制台设置强口令（`WEB_PASS` / `PROXY_PASS` ≥ 12 位），否则 Worker 不会工作。
+2. 在 VPS 防火墙（iptables/云厂商安全组）上把代理端口的来源限制为你自己的 IP。
+3. 如需更高安全，可在代理端口前加装 stunnel 或改走 SSH 隧道。
+
+## 已知限制
+
+- 代理协议本身仍无传输加密（见上表 #4），这是架构级取舍：要根治需引入 TLS 代理协议。
+- 内存限流仅在单个 isolate 内生效，生产环境请再叠加 Cloudflare 控制台的 Rate Limiting 规则。
+
+---
+
 # 一键极速部署  
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/a6216abcd/Free-Residential-IP-Proxy-Controller)
@@ -105,14 +135,16 @@ wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh
    * 在 `D1 Database Bindings` 处添加绑定。
    * **Variable name** 必须严格填入：`DB`
    * **D1 Database** 选择第一步创建的 `proxy-db`。
-4. **配置环境变量 (Environment Variables)**（必须设置！！！不填则使用系统弱口令，极易被扫描器爆破）：
+4. **配置环境变量 (Environment Variables)**（必须设置！！！`WEB_PASS` / `PROXY_PASS` 长度至少 12 位且不能是常见弱口令，否则 Worker 将直接拒绝服务 fail-closed）：
 
-| 变量名 | 默认值 | 作用说明 |
-| --- | --- | --- |
-| `WEB_USER` | `admin` | 面板 Web 登录用户名 |
-| `WEB_PASS` | `admin888` | 面板 Web 登录密码 |
-| `PROXY_USER` | `proxy` | Socks5/HTTP 代理连接用户名 |
-| `PROXY_PASS` | `888888` | Socks5/HTTP 代理连接密码 |
+| 变量名 | 作用说明 |
+| --- | --- |
+| `WEB_USER` | 面板 Web 登录用户名 |
+| `WEB_PASS` | 面板 Web 登录密码（≥12 位，强口令） |
+| `PROXY_USER` | Socks5/HTTP 代理连接用户名 |
+| `PROXY_PASS` | Socks5/HTTP 代理连接密码（≥12 位，强口令） |
+
+> 部署完成后请立即在 Cloudflare 控制台 **Settings → Variables** 中设置以上变量并重新部署。**切勿把真实口令提交到版本库。**
 
 5. 进入 **Quick edit**（快速编辑），将本仓库提供的 `Worker` 全量代码粘贴覆盖，点击 **Save and Deploy**。
 
@@ -120,10 +152,10 @@ wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh
 
 准备一台干净的 Linux VPS（推荐 Ubuntu 20.04/22.04 或 Debian 11/12 系统），通过 SSH 以 `root` 身份登录。
 
-访问您刚才部署的 Cloudflare Worker 域名（需输入配置的 `WEB_USER` 和 `WEB_PASS` 进行 Basic Auth 认证）。在面板右上角复制自动生成的纳管命令并执行：
+访问您刚才部署的 Cloudflare Worker 域名（需输入配置的 `WEB_USER` 和 `WEB_PASS` 进行 Basic Auth 认证）。在面板右上角复制自动生成的纳管命令并执行（命令已携带鉴权信息，**请勿外泄此命令**）：
 
 ```bash
-bash <(curl -sL (https://您的worker域名.workers.dev/agent))
+bash <(curl -sL -u "面板用户名:面板密码" https://您的worker域名.workers.dev/agent)
 
 ```
 

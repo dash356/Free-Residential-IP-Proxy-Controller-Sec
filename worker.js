@@ -1,17 +1,71 @@
-// ====== 免费住宅IP智能调度系统 (单端口自定义 + 智能区域双重熔断释放 + 全球全量国家版) ======
+// ====== 免费住宅IP智能调度系统 (安全加固版) ======
+
+// 鉴权失败计数（同 isolate 内共享；见 fetch 内 authRateLimited 说明）
+const AUTH_FAILS = new Map();
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const domain = url.origin;
 
-    // --- 提取并处理云端安全隔离变量 ---
-    const WEB_USER = env.WEB_USER || "admin";        
-    const WEB_PASS = env.WEB_PASS || "admin888";     
-    const PROXY_USER = env.PROXY_USER || "proxyuser";   
-    const PROXY_PASS = env.PROXY_PASS || "888888";   
+    // --- 提取云端变量（不再提供弱口令默认值；未配置强口令则拒绝服务）---
+    const WEB_USER = env.WEB_USER || "";
+    const WEB_PASS = env.WEB_PASS || "";
+    const PROXY_USER = env.PROXY_USER || "";
+    const PROXY_PASS = env.PROXY_PASS || "";
     const configuredProxyPort = env.PROXY_PORT ? parseInt(env.PROXY_PORT, 10) : 10001;
     const PROXY_PORT = Number.isInteger(configuredProxyPort) && configuredProxyPort >= 1 && configuredProxyPort <= 65535 ? configuredProxyPort : 10001;
+
+    // ====================================================
+    // [安全基线] 弱口令直接拒绝服务（fail closed）
+    // 口令必须长度 >= 12 且不在常见弱口令表内，否则所有路由返回 500
+    // ====================================================
+    const WEAK_SECRETS = new Set(["admin", "admin888", "888888", "password", "123456", "12345678", "qwerty", "proxy", "proxyuser", "changeme", "letmein"]);
+    const isWeakSecret = (s) => {
+      const v = String(s || "");
+      return v.length < 12 || WEAK_SECRETS.has(v.toLowerCase());
+    };
+    if (isWeakSecret(WEB_PASS) || isWeakSecret(PROXY_PASS)) {
+      return new Response(
+        "Server misconfigured: set strong WEB_PASS and PROXY_PASS (at least 12 characters, not a common password) in Worker environment variables before use.",
+        { status: 500, headers: { "Content-Type": "text/plain;charset=UTF-8" } }
+      );
+    }
+
+    // ====================================================
+    // [安全基线] 简易内存限流（同 isolate 内生效；生产环境请再叠加 Cloudflare 控制台的 Rate Limiting 规则）
+    // ====================================================
+    const clientIp = (request) => request.headers.get("CF-Connecting-IP") || "unknown";
+    const authRateLimited = (request) => {
+      const now = Date.now();
+      let rec = AUTH_FAILS.get(clientIp(request));
+      if (!rec || now > rec.resetAt) {
+        rec = { count: 0, resetAt: now + 60000, blockedUntil: 0 };
+        AUTH_FAILS.set(clientIp(request), rec);
+      }
+      return now < rec.blockedUntil;
+    };
+    const noteAuthFail = (request) => {
+      const now = Date.now();
+      const ip = clientIp(request);
+      let rec = AUTH_FAILS.get(ip);
+      if (!rec || now > rec.resetAt) {
+        rec = { count: 0, resetAt: now + 60000, blockedUntil: 0 };
+        AUTH_FAILS.set(ip, rec);
+      }
+      rec.count++;
+      if (rec.count >= 10) rec.blockedUntil = now + 5 * 60000; // 1 分钟内失败 10 次则封 5 分钟
+    };
+
+    // 常量时间字符串比较，防御时序攻击
+    const timingSafeEqualStr = (a, b) => {
+      const ab = new TextEncoder().encode(String(a));
+      const bb = new TextEncoder().encode(String(b));
+      if (ab.length !== bb.length) return false;
+      let diff = 0;
+      for (let i = 0; i < ab.length; i++) diff |= ab[i] ^ bb[i];
+      return diff === 0;
+    };
 
     // ====================================================
     // [基础防御] 浏览器与安全节点 Basic Auth 鉴权函数
@@ -19,19 +73,25 @@ export default {
     const authenticate = (request) => {
       const authHeader = request.headers.get("Authorization");
       if (!authHeader) return false;
-      const [scheme, encoded] = authHeader.split(" ");
+      const spaceIdx = authHeader.indexOf(" ");
+      if (spaceIdx === -1) return false;
+      const scheme = authHeader.slice(0, spaceIdx);
+      const encoded = authHeader.slice(spaceIdx + 1);
       if (scheme !== "Basic") return false;
       try {
         const decoded = atob(encoded);
-        const [username, password] = decoded.split(":");
-        return username === WEB_USER && password === WEB_PASS;
+        const colonIdx = decoded.indexOf(":");
+        if (colonIdx === -1) return false;
+        const username = decoded.slice(0, colonIdx);
+        const password = decoded.slice(colonIdx + 1); // 只按第一个冒号切分，口令可含冒号
+        return timingSafeEqualStr(username, WEB_USER) && timingSafeEqualStr(password, WEB_PASS);
       } catch (e) {
         return false;
       }
     };
 
     const unauthorizedResponse = () => {
-      return new Response("Unauthorized Access. Scanner Blocked.", {
+      return new Response("Unauthorized.", {
         status: 401,
         headers: {
           "WWW-Authenticate": 'Basic realm="Residential Proxy Security Control"',
@@ -39,6 +99,25 @@ export default {
         }
       });
     };
+
+    // ====================================================
+    // [安全基线] 统一鉴权门：所有敏感路由（含 /scripts/* 与 /agent）在业务逻辑之前鉴权
+    // ====================================================
+    const SENSITIVE_PATHS = new Set([
+      "/", "/api/config", "/api/nodes", "/api/proxies", "/api/report", "/api/switch",
+      "/agent", "/scripts/proxy_server.py", "/scripts/lite_manager.py"
+    ]);
+    if (SENSITIVE_PATHS.has(url.pathname)) {
+      if (authRateLimited(request)) {
+        return new Response("Too many failed attempts. Try again later.", {
+          status: 429, headers: { "Content-Type": "text/plain;charset=UTF-8" }
+        });
+      }
+      if (!authenticate(request)) {
+        noteAuthFail(request);
+        return unauthorizedResponse();
+      }
+    }
 
     // ====================================================
     // [1] 数据库建表 (D1)
@@ -68,11 +147,24 @@ export default {
     if (url.pathname === "/scripts/proxy_server.py") {
       const PROXY_CODE = `#!/usr/bin/env python3
 from __future__ import annotations
-import select, socket, threading, urllib.parse, time, base64
+import select, socket, threading, urllib.parse, time, base64, json, struct, random
 from typing import Any
 
-PROXY_USER = b"${PROXY_USER}"
-PROXY_PASS = b"${PROXY_PASS}"
+# [安全] 凭证不再由 C2 下发时硬编码，改为读取本机 600 权限的 c2.json（由 /agent 安装脚本写入）
+def _load_c2_conf():
+    try:
+        with open("/opt/proxy_lite/c2.json", "r") as _f:
+            return json.load(_f)
+    except Exception:
+        return {}
+_C2CONF = _load_c2_conf()
+PROXY_USER = str(_C2CONF.get("proxy_user", "")).encode()
+PROXY_PASS = str(_C2CONF.get("proxy_pass", "")).encode()
+
+# [安全] 连接数上限与空闲超时，防线程耗尽 DoS
+_MAX_CONN = 200
+_conn_sem = threading.BoundedSemaphore(_MAX_CONN)
+_IDLE_TIMEOUT = 300
 
 def parse_int(value: Any) -> int:
     try: return int(value)
@@ -86,10 +178,69 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
         data += chunk
     return data
 
+def _dns_query(host: str, bind_interface: str, dns_server: str = "8.8.8.8", timeout: float = 8) -> str:
+    # [安全] 极简 DNS/UDP 客户端：查询走隧道内，防止把代理目标域名暴露给 VPS 服务商
+    qid = random.randint(0, 65535)
+    header = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    qname = b"".join([bytes([len(label)]) + label.encode("idna") for label in host.rstrip(".").split(".")]) + b"\\x00"
+    packet = header + qname + struct.pack(">HH", 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.settimeout(timeout)
+        if bind_interface:
+            s.setsockopt(socket.SOL_SOCKET, 25, bind_interface.encode("utf-8"))
+        s.sendto(packet, (dns_server, 53))
+        data, _ = s.recvfrom(512)
+    finally:
+        s.close()
+    if len(data) < 12 or struct.unpack(">H", data[:2])[0] != qid:
+        raise OSError("bad dns reply")
+    ancount = struct.unpack(">H", data[6:8])[0]
+    off = 12
+    while off < len(data) and data[off] != 0:
+        off += data[off] + 1
+    off += 5
+    for _ in range(ancount):
+        if off + 10 > len(data):
+            break
+        if data[off] & 0xC0 == 0xC0:
+            off += 2
+        else:
+            while off < len(data) and data[off] != 0:
+                off += data[off] + 1
+            off += 1
+        if off + 10 > len(data):
+            break
+        rtype, rclass, _, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+        off += 10
+        rdata = data[off:off + rdlen]
+        off += rdlen
+        if rtype == 1 and rclass == 1 and rdlen == 4:
+            return socket.inet_ntoa(rdata)
+    raise OSError("no A record")
+
+def resolve_host(host: str, bind_interface: str) -> str:
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, host)
+            return host
+        except OSError:
+            pass
+    try:
+        if bind_interface:
+            return _dns_query(host, bind_interface)
+    except Exception:
+        pass
+    return socket.gethostbyname(host)
+
 def create_connection(address: tuple[str, int], bind_interface: str, timeout: float = 20) -> socket.socket:
     host, port = address
     err = None
-    for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+    try:
+        resolved = resolve_host(host, bind_interface)
+    except Exception as e:
+        raise OSError("dns failed: {}".format(e))
+    for res in socket.getaddrinfo(resolved, port, 0, socket.SOCK_STREAM):
         af, socktype, proto, canonname, sa = res
         sock = None
         try:
@@ -106,14 +257,19 @@ def create_connection(address: tuple[str, int], bind_interface: str, timeout: fl
 
 def relay(left: socket.socket, right: socket.socket) -> None:
     sockets = [left, right]
+    last_active = time.time()
     while True:
-        readable, _, errored = select.select(sockets, [], sockets, 120)
-        if errored: return
+        readable, _, errored = select.select(sockets, [], sockets, 60)
+        if errored:
+            return
+        if time.time() - last_active > _IDLE_TIMEOUT:
+            return  # [安全] 空闲连接超时断开，防连接堆积
         for source in readable:
             target = right if source is left else left
             data = source.recv(65536)
             if not data: return
             target.sendall(data)
+            last_active = time.time()
 
 def socks5_client(client: socket.socket, first_byte: bytes, bind_interface: str) -> None:
     upstream = None
@@ -208,6 +364,9 @@ def proxy_client(client: socket.socket, address: tuple[str, int], bind_interface
     except:
         try: client.close()
         except: pass
+    finally:
+        try: _conn_sem.release()
+        except: pass
 
 def start_proxy_server(host: str, port: int, bind_interface: str = "tun0") -> None:
     try:
@@ -219,6 +378,11 @@ def start_proxy_server(host: str, port: int, bind_interface: str = "tun0") -> No
     while True:
         try:
             client, address = server.accept()
+            if not _conn_sem.acquire(blocking=False):
+                # [安全] 连接数达上限直接拒绝，防线程耗尽 DoS
+                try: client.close()
+                except: pass
+                continue
             threading.Thread(target=proxy_client, args=(client, address, bind_interface), daemon=True).start()
         except: time.sleep(0.5)
 `;
@@ -236,7 +400,7 @@ from pathlib import Path
 MAX_CONCURRENT_NODES = 1
 BASE_PROXY_PORT = ${PROXY_PORT}
 API_URL = "https://www.vpngate.net/api/iphone/"
-C2_URL = "${domain}"
+C2_URL = ""  # [安全] 由 load_c2_conf() 从本机 c2.json 填充，不再由 C2 下发时硬编码
 
 WORKSPACE = Path("/opt/proxy_lite")
 CONFIG_DIR = WORKSPACE / "configs"
@@ -249,8 +413,20 @@ GOLDEN_NODES_FILE = WORKSPACE / "golden_nodes.json"
 golden_nodes = {}
 golden_lock = threading.Lock()
 
-WEB_USER = "${WEB_USER}"
-WEB_PASS = "${WEB_PASS}"
+# [安全] 所有凭证从本机 600 权限的 c2.json 读取（由 /agent 安装脚本写入），C2 下发代码中不再包含任何口令
+WEB_USER = ""
+WEB_PASS = ""
+
+def load_c2_conf():
+    global WEB_USER, WEB_PASS, C2_URL
+    try:
+        with open(str(WORKSPACE / "c2.json"), "r") as f:
+            conf = json.load(f)
+        WEB_USER = str(conf.get("web_user", ""))
+        WEB_PASS = str(conf.get("web_pass", ""))
+        C2_URL = str(conf.get("c2_url", ""))
+    except Exception as e:
+        print("[-] 无法读取 c2.json，请重新运行纳管命令: {}".format(e), flush=True)
 
 dynamic_slot_map = {0: "JP"}
 control_mode = "auto"
@@ -473,6 +649,7 @@ def c2_heartbeat_loop():
         except: pass
 
 def setup_env():
+    load_c2_conf()
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     sys.stdout = BoundedTee(sys.__stdout__, MANAGER_LOG_FILE)
     sys.stderr = BoundedTee(sys.__stderr__, MANAGER_LOG_FILE)
@@ -515,10 +692,53 @@ def setup_routing(slot: int):
     subprocess.run(["ip", "route", "add", "default", "dev", dev, "table", table], capture_output=True)
     subprocess.run(["ip", "rule", "add", "oif", dev, "table", table], capture_output=True)
 
+# [安全] OpenVPN 配置指令黑名单：第三方志愿者节点下发的 .ovpn 以 root 身份执行，
+# 配置文件内手写的 redirect-gateway / route / dhcp-option / up / down 等指令不受
+# 命令行 --route-nopull 限制，必须在写入前过滤，含危险指令的节点直接拒收并拉黑。
+_OVPN_BLOCKED_DIRECTIVES = (
+    "redirect-gateway", "redirect-private",
+    "route", "route-ipv6", "route-delay", "route-metric", "route-up", "route-pre-down",
+    "dhcp-option", "dhcp-renew", "dhcp-release",
+    "up", "down", "ipchange", "tls-verify",
+    "auth-user-pass-verify", "client-connect", "client-disconnect", "learn-address",
+    "plugin", "management", "management-hold", "management-query-passwords",
+    "http-proxy", "http-proxy-option", "http-proxy-retry", "http-proxy-timeout", "socks-proxy",
+    "setenv", "setenv-safe", "setenv-opt", "script-security", "pull-filter",
+    "pkcs12", "askpass", "auth-retry",
+)
+
+def sanitize_ovpn_config(text):
+    """清洗第三方下发的 OpenVPN 配置。返回 (cleaned_text, ok)，
+    ok 为 False 表示配置含有危险指令，调用方应拒收该节点。内联证书块(<ca>/<cert>/...)原样保留。"""
+    out_lines = []
+    in_block = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        if line.startswith("<"):
+            in_block = not line.startswith("</")
+            out_lines.append(raw)
+            continue
+        if in_block:
+            out_lines.append(raw)
+            continue
+        key = line.split()[0].lower()
+        if key in _OVPN_BLOCKED_DIRECTIVES:
+            return "", False
+        out_lines.append(raw)
+    return "\n".join(out_lines) + "\n", True
+
 def connect_slot(slot: int, node: dict):
     try:
         dev, cfg_path, log_file = f"tun{slot}", CONFIG_DIR / f"tun{slot}.ovpn", WORKSPACE / f"ovpn_err_{slot}.log"
-        cfg_path.write_text(node["config"])
+        clean_cfg, cfg_ok = sanitize_ovpn_config(node["config"])
+        if not cfg_ok:
+            print("[-] 单端口 ({}) 节点配置含危险指令，已拒收并拉黑24h: {}".format(node["country"], node["ip"]), flush=True)
+            add_to_blacklist(node["ip"], node["country"], reason="evil-config", duration=86400)
+            with pool_lock: pool[slot]["connecting"] = False
+            return
+        cfg_path.write_text(clean_cfg)
         ovpn_version = subprocess.run(["openvpn", "--version"], capture_output=True, text=True).stdout
         cipher_args = ["--ncp-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"] if "2.4" in ovpn_version else ["--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305", "--data-ciphers-fallback", "AES-128-CBC"]
         cmd = ["openvpn", "--config", str(cfg_path), "--dev", dev, "--dev-type", "tun", "--pull-filter", "ignore", "route-ipv6", "--pull-filter", "ignore", "ifconfig-ipv6", "--route-nopull", "--auth-user-pass", str(AUTH_FILE), "--auth-nocache", "--connect-timeout", "10", "--connect-retry-max", "1", "--verb", "3"] + cipher_args
@@ -539,7 +759,18 @@ def connect_slot(slot: int, node: dict):
             is_residential = True
             try:
                 print(f"[*] 单端口 ({node['country']}) 隧道初步打通，鉴定是否为纯正住宅IP...", flush=True)
-                req_url = f"https://ip.net.coffee/ip/{node['ip']}"
+                # [修复] 先经隧道获取真实出口 IP，再查该 IP 的类型；原来误查了 VPN 服务器 IP
+                egress_ip = ""
+                try:
+                    egr = subprocess.run(
+                        ["curl", "-s", "-m", "10", "--interface", f"tun{slot}", "https://api.ipify.org"],
+                        capture_output=True, text=True, timeout=15)
+                    egress_ip = (egr.stdout or "").strip()
+                except Exception:
+                    egress_ip = ""
+                check_ip = egress_ip or node["ip"]
+                print(f"[*] 隧道出口 IP 为 {check_ip}，正在鉴定...", flush=True)
+                req_url = f"https://ip.net.coffee/ip/{check_ip}"
                 check_req = urllib.request.Request(req_url, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(check_req, timeout=10) as check_res:
                     api_resp = check_res.read().decode("utf-8").lower()
@@ -743,10 +974,14 @@ if __name__ == "__main__":
     // [4] 动态分发：VPS 一键安装脚本
     // ====================================================
     if (url.pathname === "/agent") {
+      // [安全] 安装脚本经统一鉴权门校验后下发；凭据以 JSON 形式写入本机 c2.json（600 权限），
+      // 下发的 .py 引擎代码中不再包含任何口令。heredoc 使用 quoted 分隔符，JSON 由服务端生成，无注入风险。
+      const c2conf = JSON.stringify({ web_user: WEB_USER, web_pass: WEB_PASS, proxy_user: PROXY_USER, proxy_pass: PROXY_PASS, c2_url: domain });
       const agentScript = `#!/usr/bin/env bash
 echo "=========================================================="
-echo "    免费住宅IP智能调度系统 直连部署 (智能防枯竭单端口版)"
+echo "    免费住宅IP智能调度系统 直连部署 (安全加固版)"
 echo "=========================================================="
+set -e
 
 crontab -l 2>/dev/null | grep -v "/opt/proxy_lite/heartbeat.sh" | crontab -
 rm -f /opt/proxy_lite/heartbeat.sh
@@ -757,11 +992,20 @@ apt-get install -y openvpn python3 curl iproute2 iptables cron
 mkdir -p /opt/proxy_lite/configs
 cd /opt/proxy_lite
 
-echo "[1/3] 从调度中心拉取智能隔离引擎..."
-curl -sLo lite_manager.py ${domain}/scripts/lite_manager.py
-curl -sLo proxy_server.py ${domain}/scripts/proxy_server.py
+echo "[1/4] 写入 C2 凭证配置 (仅 root 可读)..."
+cat > /opt/proxy_lite/c2.json << 'C2JSON_EOF'
+${c2conf}
+C2JSON_EOF
+chmod 600 /opt/proxy_lite/c2.json
+C2_URL="${domain}"
+C2_AUTH="$(python3 -c "import json;d=json.load(open('/opt/proxy_lite/c2.json'));print(d['web_user']+':'+d['web_pass'])")"
 
-echo "[2/3] 配置系统群组守护..."
+echo "[2/4] 从调度中心拉取智能隔离引擎 (鉴权下载)..."
+curl -sfL -u "$C2_AUTH" "$C2_URL/scripts/lite_manager.py" -o lite_manager.py
+curl -sfL -u "$C2_AUTH" "$C2_URL/scripts/proxy_server.py" -o proxy_server.py
+chmod 600 lite_manager.py proxy_server.py
+
+echo "[3/4] 配置系统群组守护..."
 cat > /lib/systemd/system/proxy-lite.service << 'EOF'
 [Unit]
 Description=Residential Proxy Core Engine
@@ -792,7 +1036,9 @@ systemctl restart systemd-journald
 journalctl --vacuum-size=50M --vacuum-time=7d >/dev/null 2>&1 || true
 systemctl restart proxy-lite.service
 
-echo "[+] 智能时效隔离版本部署成功！稳定机房节点免死金牌机制已生效。"
+echo "[4/4] 校验引擎启动..."
+sleep 3
+systemctl is-active --quiet proxy-lite.service && echo "[+] 安全加固版部署成功，守护进程运行中。" || echo "[!] 服务未正常启动，请检查 journalctl -u proxy-lite.service"
 `;
       return new Response(agentScript, { headers: { "Content-Type": "text/plain;charset=UTF-8" } });
     }
@@ -828,12 +1074,7 @@ echo "[+] 智能时效隔离版本部署成功！稳定机房节点免死金牌�
         }
     }
 
-    // ====================================================
-    // [6] 安全敏感接口拦截区
-    // ====================================================
-    if (url.pathname === "/" || url.pathname === "/api/config" || url.pathname === "/api/nodes" || url.pathname === "/api/proxies" || url.pathname === "/api/report" || url.pathname === "/api/switch") {
-      if (!authenticate(request)) return unauthorizedResponse();
-    }
+    // [6] API 接口区（鉴权已在顶部统一鉴权门完成，此处不再重复）
 
     if (url.pathname === "/api/config" && request.method === "GET") {
         const { results } = await env.DB.prepare(`SELECT key, value FROM global_config WHERE key IN ('slot_map', 'force_switch', 'proxy_port', 'mode', 'manual_node_ip', 'youtube_check', 'config_fetch_interval', 'heartbeat_interval', 'frontend_poll_interval')`).all();
@@ -956,14 +1197,28 @@ echo "[+] 智能时效隔离版本部署成功！稳定机房节点免死金牌�
     }
 
     if (url.pathname === "/") {
-      return new Response(DASHBOARD_HTML(domain, WEB_USER, WEB_PASS, PROXY_USER, PROXY_PASS, PROXY_PORT), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
+      // [安全] 面板响应附加安全头：CSP 防 XSS、DENY 防点击劫持
+      return new Response(DASHBOARD_HTML(domain, WEB_USER, WEB_PASS, PROXY_PORT), {
+        headers: {
+          "Content-Type": "text/html;charset=UTF-8",
+          "Content-Security-Policy": "default-src 'self'; script-src 'self' https://cdn.tailwindcss.com 'unsafe-inline'; style-src 'self' https://cdn.tailwindcss.com 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'deny'",
+          "X-Frame-Options": "DENY",
+          "X-Content-Type-Options": "nosniff",
+          "Referrer-Policy": "no-referrer"
+        }
+      });
     }
 
     return new Response("Not Found", { status: 404 });
   }
 };
 
-const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPort) => `
+const DASHBOARD_HTML = (domain, webUser, webPass, proxyPort) => {
+  // [安全] 面板不再明文展示任何凭证；纳管命令携带鉴权信息（shell 转义 + HTML 转义），请勿外泄此命令
+  const htmlEsc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const shEsc = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
+  const bootstrapCmdHtml = htmlEsc("bash <(curl -sL -u " + shEsc(webUser + ":" + webPass) + " " + domain + "/agent)");
+  return `
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -989,12 +1244,8 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
             
             <div class="flex flex-col items-end gap-2">
                 <div class="glass-card p-4 rounded-2xl border border-white/10">
-                    <p class="text-[11px] tracking-widest uppercase text-slate-500 mb-2">Provision New VPS</p>
-                    <code class="text-emerald-300 text-xs md:text-sm select-all break-all">bash &lt;(curl -sL ${domain}/agent)</code>
-                </div>
-                <div class="glass-card p-3 px-4 rounded-2xl border border-white/10 w-full text-right text-xs text-slate-400">
-                    <div>面板凭证 <span class="text-cyan-300 font-bold font-mono">${webUser}</span> <span class="text-slate-600">/</span> <span class="text-cyan-300 font-bold font-mono">${webPass}</span></div>
-                    <div class="mt-1">代理凭证 <span class="text-amber-300 font-bold font-mono">${proxyUser}</span> <span class="text-slate-600">/</span> <span class="text-amber-300 font-bold font-mono">${proxyPass}</span></div>
+                    <p class="text-[11px] tracking-widest uppercase text-slate-500 mb-2">Provision New VPS（命令含鉴权口令，请勿外泄）</p>
+                    <code class="text-emerald-300 text-xs md:text-sm select-all break-all">${bootstrapCmdHtml}</code>
                 </div>
             </div>
         </div>
@@ -1069,6 +1320,8 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
     </style>
 
     <script>
+        // [安全] HTML 转义：所有来自服务端/外部的数据在经 innerHTML 渲染前必须转义，防存储型 XSS
+        const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
         // === 伪同步日志系统 ===
         const terminalLogs = [];
         function pushLog(msg, type="INFO") {
@@ -1085,7 +1338,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
             if(type === 'SUCCESS') color = 'text-green-400';
             if(type === 'SYS') color = 'text-blue-300';
 
-            terminalLogs.push(\`<span class="text-gray-500">[\${timeStr}]</span> <span class="\${color}">[\${type}] \${msg}</span>\`);
+            terminalLogs.push(\`<span class="text-gray-500">[\${timeStr}]</span> <span class="\${color}">[\${type}] \${esc(msg)}</span>\`);
             if(terminalLogs.length > 50) terminalLogs.shift();
             
             term.innerHTML = terminalLogs.join('<br>');
@@ -1112,7 +1365,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
                 const list = await res.json();
                 const container = document.getElementById('countries-list');
                 list.sort();
-                container.innerHTML = list.map(c => \`<span class="bg-gray-700 px-2 py-1 rounded text-xs font-bold text-gray-300 border border-gray-600 cursor-pointer hover:bg-gray-600 transition" onclick="document.getElementById('slot-cfg-0').value='\${c}'">\${c}</span>\`).join('');
+                container.innerHTML = list.map(c => \`<span class="bg-gray-700 px-2 py-1 rounded text-xs font-bold text-gray-300 border border-gray-600 cursor-pointer hover:bg-gray-600 transition" onclick="document.getElementById('slot-cfg-0').value='\${esc(c)}'">\${esc(c)}</span>\`).join('');
             } catch(e) {}
         }
 
@@ -1137,7 +1390,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
                         <div class="flex flex-col gap-2 min-w-56 flex-1">
                             <label for="manual-node" class="text-[12px] text-gray-400 text-left">手动节点</label>
                             <select id="manual-node" class="bg-gray-800 border border-gray-600 rounded p-2 text-white font-mono focus:outline-none focus:border-blue-400 transition w-full">
-                                <option value="\${map_data.manual_node_ip || ''}">等待节点列表...</option>
+                                <option value="\${esc(map_data.manual_node_ip || '')}">等待节点列表...</option>
                             </select>
                         </div>
                         <div class="flex flex-col gap-2 w-48">
@@ -1169,7 +1422,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
                                 </svg>
                             </button>
                             </div>
-                            <input type="text" id="slot-cfg-0" value="\${val}" class="bg-gray-800 border border-gray-600 rounded p-2 text-white text-center font-bold text-xl uppercase focus:outline-none focus:border-blue-400 transition w-full" />
+                            <input type="text" id="slot-cfg-0" value="\${esc(val)}" class="bg-gray-800 border border-gray-600 rounded p-2 text-white text-center font-bold text-xl uppercase focus:outline-none focus:border-blue-400 transition w-full" />
                         </div>
                     </div>
                 \`;
@@ -1199,7 +1452,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
             });
             candidates.sort((a, b) => (a.ping || 9999) - (b.ping || 9999) || String(a.country || '').localeCompare(String(b.country || '')) || String(a.ip).localeCompare(String(b.ip)));
             select.innerHTML = '<option value="">请选择可用节点</option>' + candidates.map(node =>
-                \`<option value="\${node.ip}">\${node.country || '--'} | \${node.ip} | \${node.ping || '?'} ms</option>\`
+                \`<option value="\${esc(node.ip)}">\${esc(node.country || '--')} | \${esc(node.ip)} | \${esc(node.ping || '?')} ms</option>\`
             ).join('');
             if (candidates.some(node => node.ip === selected)) select.value = selected;
             toggleManualMode();
@@ -1286,11 +1539,11 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
                         const dList = JSON.parse(s.details || '[]');
                         const evtRand = Math.random();
                         if (evtRand > 0.8) {
-                            pushLog(\`节点 [\${s.ip}] 心跳数据已同步，当前健康存活链路: \${dList.length}/1\`, 'SUCCESS');
+                            pushLog(\`节点 [\${esc(s.ip)}] 心跳数据已同步，当前健康存活链路: \${dList.length}/1\`, 'SUCCESS');
                         } else if (evtRand > 0.5 && dList.length < 1) {
-                            pushLog(\`节点 [\${s.ip}] 正在从黄金储备池中提取“免死金牌”极品节点...\`, 'INFO');
+                            pushLog(\`节点 [\${esc(s.ip)}] 正在从黄金储备池中提取“免死金牌”极品节点...\`, 'INFO');
                         } else if (evtRand > 0.3) {
-                            pushLog(\`节点 [\${s.ip}] 路由表重组完成，黄金历史节点已豁免下发。\`, 'SYS');
+                            pushLog(\`节点 [\${esc(s.ip)}] 路由表重组完成，黄金历史节点已豁免下发。\`, 'SYS');
                         }
                     }
                 });
@@ -1303,8 +1556,8 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
 
                     let proxyBadges = details.map(d => 
                         \`<div class="inline-flex items-center bg-gray-700 border border-gray-600 rounded px-2 py-1 mr-2 mb-2 text-xs">
-                            <span class="text-blue-400 font-bold mr-2">\${d.country}</span>
-                            <span class="font-mono text-blue-200 mr-2" title="节点物理IP">\${d.node_ip || '分配中...'}:\${d.port}</span>
+                            <span class="text-blue-400 font-bold mr-2">\${esc(d.country)}</span>
+                            <span class="font-mono text-blue-200 mr-2" title="节点物理IP">\${esc(d.node_ip || '分配中...')}:\${esc(d.port)}</span>
                         </div>\`
                     ).join('');
 
@@ -1312,7 +1565,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
 
                     return \`
                         <tr class="hover:bg-gray-750 transition-colors">
-                            <td class="py-4 px-4 font-mono text-lg text-blue-300 align-top">\${server.ip}</td>
+                            <td class="py-4 px-4 font-mono text-lg text-blue-300 align-top">\${esc(server.ip)}</td>
                             <td class="py-4 px-4 align-top">\${proxyBadges}</td>
                             <td class="py-4 px-4 text-gray-400 align-top">\${timeAgo}s 前</td>
                             <td class="py-4 px-4 align-top text-right">
@@ -1332,3 +1585,4 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
 </body>
 </html>
 `;
+};

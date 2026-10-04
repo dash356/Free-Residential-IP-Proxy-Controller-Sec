@@ -5,12 +5,14 @@ compatibility_date = "2026-06-03"
 # 告诉 Cloudflare 这是一个普通的 Worker
 workers_dev = true
 
-# 声明代码中用到的环境变量（用户在部署页面或稍后可以修改）
+# [安全] 必须设置强口令！WEB_PASS / PROXY_PASS 长度至少 12 位且不能是常见弱口令，
+# 否则 Worker 将拒绝服务（fail closed）。请勿把真实口令提交到版本库，部署后在
+# Cloudflare 控制台 Settings -> Variables 中设置。
 [vars]
-WEB_USER = "admin"
-WEB_PASS = "admin888"
-PROXY_USER = "proxy"
-PROXY_PASS = "888888"
+WEB_USER = ""
+WEB_PASS = ""
+PROXY_USER = ""
+PROXY_PASS = ""
 
 # 声明 D1 数据库绑定
 [[d1_databases]]
