@@ -156,8 +156,23 @@ export default {
       if (await validateSession()) {
         authedViaCookie = true;
       } else if (!authenticate(request)) {
+        // [限流] 只有真正出示了凭证（Authorization 头）却验证失败时才计数；
+        // 纯匿名打开登录页属于正常访问，不计入，避免误封
+        const presentedCreds = !!request.headers.get("Authorization");
+        if (url.pathname === "/" && !presentedCreds) {
+          return new Response(LOGIN_HTML(), {
+            headers: {
+              "Content-Type": "text/html;charset=UTF-8",
+              "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'deny'",
+              "X-Frame-Options": "DENY",
+              "X-Content-Type-Options": "nosniff",
+              "Referrer-Policy": "no-referrer"
+            }
+          });
+        }
         noteAuthFail(request);
         if (url.pathname === "/") {
+          // 带错误凭证访问面板页：计入限流，但仍返回登录页（不弹原生 Basic 框）
           return new Response(LOGIN_HTML(), {
             headers: {
               "Content-Type": "text/html;charset=UTF-8",
@@ -195,6 +210,7 @@ export default {
     `).run();
 
     // [多机] 单 VPS 专属配置表：每个 VPS 独立的国家策略/手动节点/强制换IP/卸载标记
+    // boot_id 为 Agent 本机持久化启动标识：重装变化、重启不变，用于识别全新安装
     await env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS server_config (
         ip TEXT PRIMARY KEY,
@@ -203,9 +219,11 @@ export default {
         manual_node_ip TEXT DEFAULT '',
         youtube_check TEXT DEFAULT 'false',
         force_switch TEXT DEFAULT '{}',
-        pending_uninstall INTEGER DEFAULT 0
+        pending_uninstall INTEGER DEFAULT 0,
+        boot_id TEXT DEFAULT ''
       )
     `).run();
+    try { await env.DB.prepare(`ALTER TABLE server_config ADD COLUMN boot_id TEXT DEFAULT ''`).run(); } catch (e) {}
 
     // ---------- 配置读写助手 ----------
     const readGlobalConfig = async () => {
@@ -237,7 +255,7 @@ export default {
     // 确保某 VPS 有专属配置行（不存在时以全局配置为默认值创建）
     const ensureServerConfig = async (ip) => {
       const g = await readGlobalConfig();
-      await env.DB.prepare(`INSERT OR IGNORE INTO server_config (ip, slot_map, mode, manual_node_ip, youtube_check, force_switch, pending_uninstall) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)`)
+      await env.DB.prepare(`INSERT OR IGNORE INTO server_config (ip, slot_map, mode, manual_node_ip, youtube_check, force_switch, pending_uninstall, boot_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, '')`)
         .bind(ip, JSON.stringify(g.slot_map), g.mode, g.manual_node_ip, String(g.youtube_check), JSON.stringify(g.force_switch)).run();
     };
     const jsonRes = (obj) => new Response(JSON.stringify(obj), { headers: { "Content-Type": "application/json" } });
@@ -495,7 +513,7 @@ def start_proxy_server(host: str, port: int, bind_interface: str = "tun0") -> No
     // ====================================================
     if (url.pathname === "/scripts/lite_manager.py") {
       const MANAGER_CODE = `#!/usr/bin/env python3
-import base64, csv, os, subprocess, threading, time, urllib.request, urllib.parse, json, sys
+import base64, csv, os, random, subprocess, threading, time, urllib.request, urllib.parse, json, sys
 from pathlib import Path
 
 MAX_CONCURRENT_NODES = 1
@@ -538,6 +556,7 @@ heartbeat_interval = 30
 pool = {0: {"process": None, "ip": "", "country": "", "connected_at": 0, "connecting": False}}
 pool_lock = threading.Lock()
 public_ip = ""
+BOOT_ID = ""  # [防误卸载] 本机持久化启动标识：写入 WORKSPACE/boot_id，重装变化、重启不变
 
 def append_bounded_log(log_file, stream):
     try:
@@ -609,6 +628,23 @@ reservoir_lock = threading.Lock()
 _cached_snapshot = []
 _last_harvest_time = 0
 
+def get_boot_id():
+    """读取或生成本机启动标识，持久化到 WORKSPACE/boot_id。
+    守护进程重启时保持不变；rm -rf 重装后重新生成，C2 据此识别全新安装。"""
+    p = WORKSPACE / "boot_id"
+    try:
+        bid = p.read_text(encoding="utf-8").strip()
+        if bid:
+            return bid[:64]
+    except:
+        pass
+    bid = "%d-%06d" % (int(time.time()), random.randint(0, 999999))
+    try:
+        p.write_text(bid, encoding="utf-8")
+    except:
+        pass
+    return bid
+
 def get_public_ip():
     global public_ip
     try:
@@ -666,11 +702,14 @@ def remove_golden_node(ip):
     save_golden_nodes()
 
 def fetch_config():
-    # [多机] 上报本机公网 IP，C2 据此下发该 VPS 的专属策略（国家/手动节点/远程卸载指令）
+    # [多机] 上报本机公网 IP + 启动标识，C2 据此下发该 VPS 的专属策略
+    # （国家/手动节点/远程卸载指令）；boot_id 变化时 C2 会清除残留卸载标记
     query = ""
     try:
         if public_ip and public_ip != "Unknown_IP":
             query = "?ip=" + urllib.parse.quote(str(public_ip), safe="")
+            if BOOT_ID:
+                query += "&boot=" + urllib.parse.quote(str(BOOT_ID), safe="")
     except:
         pass
     req = urllib.request.Request(f"{C2_URL}/api/config{query}", headers=get_c2_headers())
@@ -738,7 +777,8 @@ def apply_config(data):
         new_map = {int(k): str(v).upper() for k, v in data.get("slot_map", {}).items()}
         force_switch = {int(k): int(v) for k, v in data.get("force_switch", {}).items()}
     else:
-        new_map = {int(k): str(v).upper() for k, v in data.items()}
+        # [兼容] 老格式：整个 dict 即 slot_map；只取数字型键，避免被 uninstall 等新增键误伤
+        new_map = {int(k): str(v).upper() for k, v in data.items() if str(k).lstrip("-").isdigit()}
         force_switch = {}
     with pool_lock:
         for slot, desired_country in new_map.items():
@@ -800,6 +840,8 @@ def c2_heartbeat_loop():
 def setup_env():
     load_c2_conf()
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    global BOOT_ID
+    BOOT_ID = get_boot_id()
     sys.stdout = BoundedTee(sys.__stdout__, MANAGER_LOG_FILE)
     sys.stderr = BoundedTee(sys.__stderr__, MANAGER_LOG_FILE)
     if not AUTH_FILE.exists():
@@ -1232,6 +1274,18 @@ systemctl is-active --quiet proxy-lite.service && echo "[+] 安全加固版部�
         if (qip) {
             await ensureServerConfig(qip);
             const sc = await env.DB.prepare(`SELECT * FROM server_config WHERE ip = ?1`).bind(qip).first();
+            // [防误卸载] boot_id 变化 = 同一 IP 上全新重装：清除残留的卸载标记并记录新 boot_id，
+            // 避免新机器一上线就被旧的卸载指令干掉；老版本 Agent 不上报 boot 则保持原行为
+            const boot = (url.searchParams.get("boot") || "").trim().slice(0, 64);
+            if (sc && boot) {
+                if (sc.boot_id && sc.boot_id !== boot) {
+                    await env.DB.prepare(`UPDATE server_config SET pending_uninstall = 0, boot_id = ?2 WHERE ip = ?1`).bind(qip, boot).run();
+                    sc.pending_uninstall = 0; sc.boot_id = boot;
+                } else if (!sc.boot_id) {
+                    await env.DB.prepare(`UPDATE server_config SET boot_id = ?2 WHERE ip = ?1`).bind(qip, boot).run();
+                    sc.boot_id = boot;
+                }
+            }
             let slot_map = g.slot_map, force_switch = g.force_switch, mode = g.mode,
                 manual_node_ip = g.manual_node_ip, youtube_check = g.youtube_check, uninstall = false;
             if (sc) {
@@ -1964,7 +2018,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyPort) => {
         }
 
         async function forceSwitchServer(ip) {
-            if (!confirm('确认强制断开 VPS [' + ip + '] 当前的隧道并换新 IP 吗？\n（当前 IP 进入 1 分钟冷却）')) return;
+            if (!confirm('确认强制断开 VPS [' + ip + '] 当前的隧道并换新 IP 吗？\\n（当前 IP 进入 1 分钟冷却）')) return;
             const res = await api('/api/server/switch', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ ip })
@@ -2007,7 +2061,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyPort) => {
                 else if (action === 'del-uninstall') await removeServer(ip, 'uninstall');
                 else if (action === 'del-force') {
                     const fromConfirm = confirmBox && !confirmBox.classList.contains('hidden');
-                    if (!fromConfirm && !confirm('该 VPS 可能仍在运行代理程序，仅删除面板记录吗？\n（VPS 上的文件需手动清理；如需自动清理请选择「远程卸载并删除」）')) return;
+                    if (!fromConfirm && !confirm('该 VPS 可能仍在运行代理程序，仅删除面板记录吗？\\n（VPS 上的文件需手动清理；如需自动清理请选择「远程卸载并删除」）')) return;
                     await removeServer(ip, 'force');
                 }
             } catch (err) { alert('操作失败：' + (err.message || err)); }
