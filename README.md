@@ -55,7 +55,7 @@
 
 # 一键极速部署  
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/a6216abcd/Free-Residential-IP-Proxy-Controller)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://https://github.com/dash356/Free-Residential-IP-Proxy-Controller-Sec)
 
 一键极速部署如果报400的错误,就是CF账户风控了，重新注册一个CF新号即可部署成功
 
