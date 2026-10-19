@@ -192,22 +192,43 @@ export default {
     // ====================================================
       await env.DB.prepare(`
         CREATE TABLE IF NOT EXISTS servers (
-          ip TEXT PRIMARY KEY,
+          node_key TEXT PRIMARY KEY,
+          ip TEXT,
           boot_id TEXT DEFAULT '',
-          node_key TEXT,
           details TEXT,
           log TEXT DEFAULT '',
           candidates TEXT DEFAULT '[]',
           last_seen INTEGER
         )
       `).run();
-      try { await env.DB.prepare(`ALTER TABLE servers ADD COLUMN log TEXT DEFAULT ''`).run(); } catch (e) {}
-      try { await env.DB.prepare(`ALTER TABLE servers ADD COLUMN candidates TEXT DEFAULT '[]'`).run(); } catch (e) {}
-      // [多机] 同一出口 IP 下多台机器：node_key(ip 或 ip|boot_id) 唯一标识上报节点，避免互相覆盖
-      try { await env.DB.prepare(`ALTER TABLE servers ADD COLUMN boot_id TEXT DEFAULT ''`).run(); } catch (e) {}
-      try { await env.DB.prepare(`ALTER TABLE servers ADD COLUMN node_key TEXT`).run(); } catch (e) {}
-      try { await env.DB.prepare(`UPDATE servers SET node_key = ip WHERE node_key IS NULL`).run(); } catch (e) {}
-      try { await env.DB.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS idx_servers_nodekey ON servers(node_key)`).run(); } catch (e) {}
+      try {
+        // 旧表(ip 主键) -> 新表(node_key 主键) 在线迁移：同一出口 IP 下多台机器需要多行共存，
+        // ip 保留主键会导致第二台机器心跳报 UNIQUE constraint failed
+        const sInfo = await env.DB.prepare(`PRAGMA table_info(servers)`).all();
+        const sCols = ((sInfo && sInfo.results) || []);
+        const sNames = sCols.map(c => c.name);
+        if (!sNames.includes('boot_id')) { try { await env.DB.prepare(`ALTER TABLE servers ADD COLUMN boot_id TEXT DEFAULT ''`).run(); } catch (e) {} }
+        if (!sNames.includes('node_key')) { try { await env.DB.prepare(`ALTER TABLE servers ADD COLUMN node_key TEXT`).run(); } catch (e) {} }
+        if (!sNames.includes('log')) { try { await env.DB.prepare(`ALTER TABLE servers ADD COLUMN log TEXT DEFAULT ''`).run(); } catch (e) {} }
+        if (!sNames.includes('candidates')) { try { await env.DB.prepare(`ALTER TABLE servers ADD COLUMN candidates TEXT DEFAULT '[]'`).run(); } catch (e) {} }
+        try { await env.DB.prepare(`UPDATE servers SET node_key = ip WHERE node_key IS NULL`).run(); } catch (e) {}
+        const pkIsIp = sCols.some(c => c.name === 'ip' && c.pk === 1);
+        if (pkIsIp) {
+          await env.DB.prepare(`
+            CREATE TABLE servers_new (
+              node_key TEXT PRIMARY KEY,
+              ip TEXT,
+              boot_id TEXT DEFAULT '',
+              details TEXT,
+              log TEXT DEFAULT '',
+              candidates TEXT DEFAULT '[]',
+              last_seen INTEGER
+            )`).run();
+          await env.DB.prepare(`INSERT OR IGNORE INTO servers_new (node_key, ip, boot_id, details, log, candidates, last_seen) SELECT node_key, ip, boot_id, details, log, candidates, last_seen FROM servers`).run();
+          await env.DB.prepare(`DROP TABLE servers`).run();
+          await env.DB.prepare(`ALTER TABLE servers_new RENAME TO servers`).run();
+        }
+      } catch (e) {}
 
     await env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS global_config (
@@ -262,7 +283,7 @@ export default {
     // ---------- 配置读写助手 ----------
     // 节点唯一标识：上报 boot_id 的新 Agent 为 ip|boot_id（同一出口 IP 下多台机器各自独立），
     // 老 Agent 为 ip（行为与原来完全一致）
-    const cleanBootId = (b) => String(b || '').replace(/\|/g, '').trim().slice(0, 64);
+    const cleanBootId = (b) => String(b || '').replace(/[\|"]/g, '').trim().slice(0, 64);
     const nodeKeyOf = (ip, bootId) => {
       const b = cleanBootId(bootId);
       return b ? `${String(ip).trim()}|${b}` : String(ip).trim();
@@ -566,7 +587,18 @@ import base64, csv, os, random, subprocess, threading, time, urllib.request, url
 from pathlib import Path
 
 MAX_CONCURRENT_NODES = 1
-BASE_PROXY_PORT = ${PROXY_PORT}
+BAKED_PROXY_PORT = ${PROXY_PORT}
+PORT_FILE = WORKSPACE / "proxy_port"
+def load_base_port():
+    # 面板修改监听端口后持久化到本机文件；重启时优先读取，避免回退到 baked 值导致无限重启
+    try:
+        p = int(PORT_FILE.read_text(encoding="utf-8").strip())
+        if 1 <= p <= 65535:
+            return p
+    except:
+        pass
+    return BAKED_PROXY_PORT
+BASE_PROXY_PORT = load_base_port()
 API_URL = "https://www.vpngate.net/api/iphone/"
 C2_URL = ""  # [安全] 由 load_c2_conf() 从本机 c2.json 填充，不再由 C2 下发时硬编码
 
@@ -809,9 +841,16 @@ def apply_config(data):
         print("[!] 收到调度中心远程卸载指令，开始清理本机...", flush=True)
         do_uninstall()
     if "proxy_port" in data:
-        new_port = int(data["proxy_port"])
+        try:
+            new_port = int(data["proxy_port"])
+        except:
+            new_port = 0
         if 1 <= new_port <= 65535 and new_port != BASE_PROXY_PORT:
             print(f"[*] 检测到监听端口变更: {BASE_PROXY_PORT} -> {new_port}，准备重启服务...", flush=True)
+            try:
+                PORT_FILE.write_text(str(new_port), encoding="utf-8")
+            except:
+                pass
             BASE_PROXY_PORT = new_port
             os._exit(0)
     new_mode = "manual" if data.get("mode") == "manual" else "auto"
@@ -1223,6 +1262,10 @@ echo "    免费住宅IP智能调度系统 直连部署 (安全加固版)"
 echo "=========================================================="
 set -e
 
+# [前置检查] 必须以 root 运行且系统具备 systemd，否则后续步骤必然失败
+if [ "$(id -u)" -ne 0 ]; then echo "[-] 请以 root 身份运行此安装脚本。" >&2; exit 1; fi
+if ! command -v systemctl >/dev/null 2>&1; then echo "[-] 本系统没有 systemd，无法安装守护进程。" >&2; exit 1; fi
+
 # [兼容] 精简系统可能尚未安装 cron：crontab 不存在时跳过旧心跳任务清理，避免 set -e 直接中断安装
 if command -v crontab >/dev/null 2>&1; then
   crontab -l 2>/dev/null | grep -v "/opt/proxy_lite/heartbeat.sh" | crontab - || true
@@ -1275,7 +1318,7 @@ SystemMaxFileSize=10M
 RuntimeMaxUse=20M
 MaxRetentionSec=7day
 EOF
-systemctl restart systemd-journald
+systemctl restart systemd-journald || true
 journalctl --vacuum-size=50M --vacuum-time=7d >/dev/null 2>&1 || true
 systemctl restart proxy-lite.service
 
@@ -1514,6 +1557,7 @@ systemctl is-active --quiet proxy-lite.service && echo "[+] 安全加固版部�
       try {
         const data = await request.json();
         const rip = String(data.ip || '').trim();
+        if (!rip) return new Response("missing ip", { status: 400 });
         const rboot = cleanBootId(data.boot_id);
         const rkey = nodeKeyOf(rip, rboot);
         await env.DB.prepare(`
@@ -1521,17 +1565,15 @@ systemctl is-active --quiet proxy-lite.service && echo "[+] 安全加固版部�
           ON CONFLICT(node_key) DO UPDATE SET ip = excluded.ip, boot_id = excluded.boot_id, details = excluded.details, log = excluded.log, candidates = excluded.candidates, last_seen = excluded.last_seen
         `).bind(rip, rboot, rkey, JSON.stringify(data.details || []), String(data.log || '').slice(-12000), JSON.stringify(data.candidates || []).slice(0, 100000), Date.now()).run();
         // [多机] 新纳管机器自动生成专属配置行（默认继承全局策略）
-        if (rip) { try { await ensureServerConfig(rip, rboot); } catch (e) {} }
+        try { await ensureServerConfig(rip, rboot); } catch (e) {}
         // [多机] 同一出口 IP 下：已失联旧节点的残留卸载标记自动清除（重装场景），避免面板残留"卸载中"
-        if (rip) {
-          try {
-            await env.DB.prepare(`
-              UPDATE server_config SET pending_uninstall = 0
-              WHERE ip = ?1 AND node_key != ?2 AND pending_uninstall = 1
-                AND NOT EXISTS (SELECT 1 FROM servers s WHERE s.node_key = server_config.node_key AND s.last_seen > ?3)
-            `).bind(rip, rkey, Date.now() - 120000).run();
-          } catch (e) {}
-        }
+        try {
+          await env.DB.prepare(`
+            UPDATE server_config SET pending_uninstall = 0
+            WHERE ip = ?1 AND node_key != ?2 AND pending_uninstall = 1
+              AND NOT EXISTS (SELECT 1 FROM servers s WHERE s.node_key = server_config.node_key AND s.last_seen > ?3)
+          `).bind(rip, rkey, Date.now() - 120000).run();
+        } catch (e) {}
         return new Response("OK", { status: 200 });
       } catch (err) { return new Response("Error", { status: 500 }); }
     }
@@ -1860,9 +1902,13 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyPort) => {
         }
 
         function renderRemoteLogs(servers) {
+            // 同一出口 IP 下多台机器时，用 boot_id 后 6 位区分日志段落
+            const ipCount = {};
+            (servers || []).forEach(s => { ipCount[s.ip] = (ipCount[s.ip] || 0) + 1; });
             const log = servers.map(server => {
                 const text = String(server.log || '').trim();
-                return text ? \`===== \${server.ip} =====\\n\${text}\` : '';
+                const suffix = ((ipCount[server.ip] || 0) > 1 && server.boot_id) ? ' #' + String(server.boot_id).slice(-6) : '';
+                return text ? \`===== \${server.ip}\${suffix} =====\\n\${text}\` : '';
             }).filter(Boolean).join('\\n');
             const remoteLog = document.getElementById('remote-log');
             if (log) {

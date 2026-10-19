@@ -159,6 +159,8 @@ console.log('== 上报/节点（单机） ==');
 {
   const r = await jpost('/api/report', { ip: '10.0.0.1', details: [{ port: 3000, country: 'JP' }], log: 'boot ok' });
   ok('老 Agent 上报（无 boot_id）OK', r.status === 200);
+  const rBad = await jpost('/api/report', { details: [] });
+  ok('上报缺 ip 返回 400（不写脏行）', rBad.status === 400);
   const nodes = await (await req('/api/nodes', { headers: authH })).json();
   ok('单节点出现在列表', nodes.length === 1 && nodes[0].ip === '10.0.0.1');
   ok('老 Agent node_key 即 ip（向后兼容）', nodes[0].node_key === '10.0.0.1');
@@ -251,6 +253,7 @@ console.log('== 下发脚本语法 ==');
   ok('lite_manager.py 编译通过', sh(0, 'python3 -m py_compile /tmp/_lite.py'));
   ok('proxy_server.py 编译通过', sh(0, 'python3 -m py_compile /tmp/_proxy.py'));
   ok('心跳上报带 boot_id', lite.includes('"boot_id": BOOT_ID'));
+  ok('端口变更持久化到本机文件（防无限重启）', lite.includes('PORT_FILE') && lite.includes('load_base_port'));
   ok('crontab 调用有守卫', agent.includes('command -v crontab'));
 }
 

@@ -49,6 +49,11 @@
 
 ### 4. 顺手修复
 - 修复了下发的 `lite_manager.py` 中一处转义 bug（模板内单 `\n` 被 JS 求值成真换行，导致 served 脚本有 Python 语法错误、Agent 无法启动）。
+- **严重**：`servers` 表曾以 `ip` 为主键，同一出口 IP 下第二台机器的心跳会报 `UNIQUE constraint failed`（500）；已在线迁移为 `node_key` 主键。
+- **严重**：面板修改「代理监听端口」后，Agent 重启会回退到 baked 旧端口导致 systemd 无限重启循环；现已持久化端口覆盖到本机文件。
+- 安装脚本：无 `crontab` 的精简系统不再中途退出；新增 root 与 systemd 前置检查；journald 重启失败不再中断安装。
+- `server_config` 在线迁移为 `node_key` 主键（保留已有配置）；`cleanBootId` 过滤引号，防面板选择器被破坏；同 IP 多机器的日志段落加 `#xxxxxx` 区分。
+- `/api/report` 缺 `ip` 时返回 400（不写脏行）；`wrangler.toml` 移除空 `[vars]` 段，避免 `wrangler deploy` 覆盖控制台已配口令。
 
 > ⚠️ **已纳管 VPS 请重新执行一次面板右上角的纳管命令**，以更新引擎（`lite_manager.py`）获得分机策略与远程卸载支持；未更新的老 Agent 仍按全局默认国家工作，不受影响。
 
