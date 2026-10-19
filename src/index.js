@@ -1174,7 +1174,10 @@ echo "    免费住宅IP智能调度系统 直连部署 (安全加固版)"
 echo "=========================================================="
 set -e
 
-crontab -l 2>/dev/null | grep -v "/opt/proxy_lite/heartbeat.sh" | crontab -
+# [兼容] 精简系统可能尚未安装 cron：crontab 不存在时跳过旧心跳任务清理，避免 set -e 直接中断安装
+if command -v crontab >/dev/null 2>&1; then
+  crontab -l 2>/dev/null | grep -v "/opt/proxy_lite/heartbeat.sh" | crontab - || true
+fi
 rm -f /opt/proxy_lite/heartbeat.sh
 
 apt-get update -q
