@@ -68,6 +68,29 @@ https://github.com/a6216abcd/K-UI/tree/dev
 - 代理协议本身仍无传输加密（见上表 #4），这是架构级取舍：要根治需引入 TLS 代理协议。
 - 内存限流仅在单个 isolate 内生效，生产环境请再叠加 Cloudflare 控制台的 Rate Limiting 规则。
 
+## 🆕 本分支新增功能（相对上游安全加固版）
+
+### 1. 美观登录页
+- 浏览器原生 Basic Auth 弹窗已替换为深色玻璃拟态登录页（渐变光斑 + 动画 + 密码可见切换 + 错误抖动反馈）。
+- 登录成功后签发 HMAC 签名的 `HttpOnly` 会话 Cookie（7 天有效，访问面板时滑动续期）；退出登录一键清除。
+- VPS Agent 与 API 工具（curl 等）继续使用 Basic Auth，不受影响；登录接口保留暴力破解限流（1 分钟 10 次失败封 5 分钟）。
+
+### 2. 多 VPS 独立策略（分机分 IP）
+- 每个 VPS 在面板上拥有独立策略卡片：出口国家、自动/手动模式、手动指定 vpngate 节点、YouTube 检测开关，可分别为不同 VPS 分配不同国家的代理 IP。
+- Agent 上报心跳时携带本机公网 IP 拉取专属配置；「强制换 IP」按单台 VPS 生效。
+- 全局设置保留：代理监听端口、Agent 拉配置/心跳间隔、面板轮询间隔下发到所有 VPS；「新 VPS 默认国家」仅用于新纳管机器的初始策略。
+
+### 3. VPS 删除（含远程卸载）
+- 面板每台 VPS 卡片新增「删除 VPS」按钮，二次确认后二选一：
+  - **远程卸载并删除（推荐）**：向 VPS 下发卸载指令，Agent 在下次同步（约 15 秒内）自动执行：停止并移除 `proxy-lite.service`、强杀 OpenVPN 残留进程、清理策略路由表、删除 `/opt/proxy_lite`（含引擎代码与凭证），最后向调度中心注销，面板记录自动消失；
+  - **仅删记录**：只从面板数据库移除（VPS 失联时用，残留文件需手动清理）。
+- 卸载中的 VPS 在面板显示「卸载中」状态并保留到注销完成，过期清理不会误删。
+
+### 4. 顺手修复
+- 修复了下发的 `lite_manager.py` 中一处转义 bug（模板内单 `\n` 被 JS 求值成真换行，导致 served 脚本有 Python 语法错误、Agent 无法启动）。
+
+> ⚠️ **已纳管 VPS 请重新执行一次面板右上角的纳管命令**，以更新引擎（`lite_manager.py`）获得分机策略与远程卸载支持；未更新的老 Agent 仍按全局默认国家工作，不受影响。
+
 ---
 
 # 一键极速部署  
@@ -200,9 +223,11 @@ http://<PROXY_USER>:<PROXY_PASS>@<VPS母机IP>:<服务端口>
 
 ---
 
-## 🗑️ 终极卸载命令
+## 🗑️ 卸载
 
-如需彻底移除 VPS 上的节点调度程序并恢复网络路由状态，请执行以下命令（已适配双活表 101/102）：
+**推荐方式**：直接在面板对应 VPS 卡片点击「删除 VPS」→「远程卸载并删除」，VPS 会自动清理并注销，无需手动 SSH。
+
+如需手动彻底移除 VPS 上的节点调度程序并恢复网络路由状态，请执行以下命令（已适配单端口表 100）：
 
 ```bash
 # 1. 停止并禁用守护进程
@@ -214,20 +239,18 @@ systemctl daemon-reload
 # 2. 强杀残留的 Python 调度器和 OpenVPN 进程
 pkill -f "lite_manager.py" 2>/dev/null
 pkill -f "proxy_server.py" 2>/dev/null
-pkill -f "openvpn.*tun_main|tun_backup" 2>/dev/null
+pkill -f "openvpn.*tun[0-9]" 2>/dev/null
 
-# 3. 清理主备双路策略路由 (防止宿主机断网)
-ip rule del lookup 101 pref 101 2>/dev/null
-ip rule del lookup 101 pref 1101 2>/dev/null
-ip route flush table 101 2>/dev/null
-ip rule del lookup 102 pref 102 2>/dev/null
-ip rule del lookup 102 pref 1102 2>/dev/null
-ip route flush table 102 2>/dev/null
+# 3. 清理单端口策略路由 (防止宿主机断网)
+ip rule del table 100 2>/dev/null
+ip route flush table 100 2>/dev/null
 
 # 4. 删除所有引擎代码和配置文件
 rm -rf /opt/proxy_lite
+rm -f /lib/systemd/system/proxy-lite.service
+systemctl daemon-reload
 
-echo "✅ 双活代理引擎及所有配置已彻底卸载清理完毕！"
+echo "✅ 代理引擎及所有配置已彻底卸载清理完毕！"
 
 ```
 
