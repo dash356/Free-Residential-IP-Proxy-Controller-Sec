@@ -193,6 +193,8 @@ export default {
       await env.DB.prepare(`
         CREATE TABLE IF NOT EXISTS servers (
           ip TEXT PRIMARY KEY,
+          boot_id TEXT DEFAULT '',
+          node_key TEXT,
           details TEXT,
           log TEXT DEFAULT '',
           candidates TEXT DEFAULT '[]',
@@ -201,6 +203,11 @@ export default {
       `).run();
       try { await env.DB.prepare(`ALTER TABLE servers ADD COLUMN log TEXT DEFAULT ''`).run(); } catch (e) {}
       try { await env.DB.prepare(`ALTER TABLE servers ADD COLUMN candidates TEXT DEFAULT '[]'`).run(); } catch (e) {}
+      // [多机] 同一出口 IP 下多台机器：node_key(ip 或 ip|boot_id) 唯一标识上报节点，避免互相覆盖
+      try { await env.DB.prepare(`ALTER TABLE servers ADD COLUMN boot_id TEXT DEFAULT ''`).run(); } catch (e) {}
+      try { await env.DB.prepare(`ALTER TABLE servers ADD COLUMN node_key TEXT`).run(); } catch (e) {}
+      try { await env.DB.prepare(`UPDATE servers SET node_key = ip WHERE node_key IS NULL`).run(); } catch (e) {}
+      try { await env.DB.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS idx_servers_nodekey ON servers(node_key)`).run(); } catch (e) {}
 
     await env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS global_config (
@@ -209,23 +216,62 @@ export default {
       )
     `).run();
 
-    // [多机] 单 VPS 专属配置表：每个 VPS 独立的国家策略/手动节点/强制换IP/卸载标记
+    // [多机] 单 VPS 专属配置表：node_key 主键，每台机器独立的国家策略/手动节点/强制换IP/卸载标记
     // boot_id 为 Agent 本机持久化启动标识：重装变化、重启不变，用于识别全新安装
     await env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS server_config (
-        ip TEXT PRIMARY KEY,
+        node_key TEXT PRIMARY KEY,
+        ip TEXT,
+        boot_id TEXT DEFAULT '',
         slot_map TEXT DEFAULT '{"0":"JP"}',
         mode TEXT DEFAULT 'auto',
         manual_node_ip TEXT DEFAULT '',
         youtube_check TEXT DEFAULT 'false',
         force_switch TEXT DEFAULT '{}',
-        pending_uninstall INTEGER DEFAULT 0,
-        boot_id TEXT DEFAULT ''
+        pending_uninstall INTEGER DEFAULT 0
       )
     `).run();
-    try { await env.DB.prepare(`ALTER TABLE server_config ADD COLUMN boot_id TEXT DEFAULT ''`).run(); } catch (e) {}
+    try {
+      // 旧表(ip 主键) -> 新表(node_key 主键) 在线迁移
+      const scInfo = await env.DB.prepare(`PRAGMA table_info(server_config)`).all();
+      const scCols = ((scInfo && scInfo.results) || []);
+      const scNames = scCols.map(c => c.name);
+      if (!scNames.includes('node_key')) { try { await env.DB.prepare(`ALTER TABLE server_config ADD COLUMN node_key TEXT`).run(); } catch (e) {} }
+      if (!scNames.includes('boot_id')) { try { await env.DB.prepare(`ALTER TABLE server_config ADD COLUMN boot_id TEXT DEFAULT ''`).run(); } catch (e) {} }
+      const pkIsIp = scCols.some(c => c.name === 'ip' && c.pk === 1);
+      if (pkIsIp) {
+        await env.DB.prepare(`UPDATE server_config SET node_key = ip WHERE node_key IS NULL`).run();
+        await env.DB.prepare(`
+          CREATE TABLE server_config_new (
+            node_key TEXT PRIMARY KEY,
+            ip TEXT,
+            boot_id TEXT DEFAULT '',
+            slot_map TEXT DEFAULT '{"0":"JP"}',
+            mode TEXT DEFAULT 'auto',
+            manual_node_ip TEXT DEFAULT '',
+            youtube_check TEXT DEFAULT 'false',
+            force_switch TEXT DEFAULT '{}',
+            pending_uninstall INTEGER DEFAULT 0
+          )`).run();
+        await env.DB.prepare(`INSERT OR IGNORE INTO server_config_new (node_key, ip, boot_id, slot_map, mode, manual_node_ip, youtube_check, force_switch, pending_uninstall) SELECT node_key, ip, boot_id, slot_map, mode, manual_node_ip, youtube_check, force_switch, pending_uninstall FROM server_config`).run();
+        await env.DB.prepare(`DROP TABLE server_config`).run();
+        await env.DB.prepare(`ALTER TABLE server_config_new RENAME TO server_config`).run();
+      }
+    } catch (e) {}
 
     // ---------- 配置读写助手 ----------
+    // 节点唯一标识：上报 boot_id 的新 Agent 为 ip|boot_id（同一出口 IP 下多台机器各自独立），
+    // 老 Agent 为 ip（行为与原来完全一致）
+    const cleanBootId = (b) => String(b || '').replace(/\|/g, '').trim().slice(0, 64);
+    const nodeKeyOf = (ip, bootId) => {
+      const b = cleanBootId(bootId);
+      return b ? `${String(ip).trim()}|${b}` : String(ip).trim();
+    };
+    const splitNodeKey = (nk) => {
+      const s = String(nk || '');
+      const i = s.indexOf('|');
+      return i === -1 ? [s, ''] : [s.slice(0, i), s.slice(i + 1)];
+    };
     const readGlobalConfig = async () => {
       const { results } = await env.DB.prepare(`SELECT key, value FROM global_config WHERE key IN ('slot_map', 'force_switch', 'proxy_port', 'mode', 'manual_node_ip', 'youtube_check', 'config_fetch_interval', 'heartbeat_interval', 'frontend_poll_interval')`).all();
       let slot_map = {0: "JP"};
@@ -252,11 +298,14 @@ export default {
       }
       return {slot_map, force_switch, proxy_port, mode, manual_node_ip, youtube_check, config_fetch_interval, heartbeat_interval, frontend_poll_interval};
     };
-    // 确保某 VPS 有专属配置行（不存在时以全局配置为默认值创建）
-    const ensureServerConfig = async (ip) => {
+    // 确保某节点有专属配置行（不存在时以全局配置为默认值创建）
+    const ensureServerConfig = async (ip, bootId = '') => {
       const g = await readGlobalConfig();
-      await env.DB.prepare(`INSERT OR IGNORE INTO server_config (ip, slot_map, mode, manual_node_ip, youtube_check, force_switch, pending_uninstall, boot_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, '')`)
-        .bind(ip, JSON.stringify(g.slot_map), g.mode, g.manual_node_ip, String(g.youtube_check), JSON.stringify(g.force_switch)).run();
+      const nk = nodeKeyOf(ip, bootId);
+      const b = cleanBootId(bootId);
+      await env.DB.prepare(`INSERT OR IGNORE INTO server_config (node_key, ip, boot_id, slot_map, mode, manual_node_ip, youtube_check, force_switch, pending_uninstall) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)`)
+        .bind(nk, String(ip).trim(), b, JSON.stringify(g.slot_map), g.mode, g.manual_node_ip, String(g.youtube_check), JSON.stringify(g.force_switch)).run();
+      return nk;
     };
     const jsonRes = (obj) => new Response(JSON.stringify(obj), { headers: { "Content-Type": "application/json" } });
 
@@ -720,7 +769,7 @@ def do_uninstall():
     """[远程卸载] 响应面板删除指令：通知 C2 注销 -> 掐断隧道 -> 清理策略路由
     -> 移除 systemd 守护 -> 删除工作目录(含本脚本与凭证) -> 退出进程。"""
     try:
-        payload = json.dumps({"ip": public_ip}).encode("utf-8")
+        payload = json.dumps({"ip": public_ip, "boot_id": BOOT_ID}).encode("utf-8")
         req = urllib.request.Request(f"{C2_URL}/api/server/uninstalled", data=payload, headers=get_c2_headers(), method="POST")
         urllib.request.urlopen(req, timeout=10)
         print("[*] 已通知调度中心注销本机纳管信息。", flush=True)
@@ -811,7 +860,7 @@ def update_config_loop():
 def c2_heartbeat_loop():
     if not public_ip or public_ip == "Unknown_IP": get_public_ip()
     try:
-        payload = json.dumps({"ip": public_ip, "details": [], "log": read_recent_logs()}).encode('utf-8')
+        payload = json.dumps({"ip": public_ip, "boot_id": BOOT_ID, "details": [], "log": read_recent_logs()}).encode('utf-8')
         req = urllib.request.Request(f"{C2_URL}/api/report", data=payload, headers=get_c2_headers(), method='POST')
         urllib.request.urlopen(req, timeout=10)
     except: pass
@@ -830,7 +879,7 @@ def c2_heartbeat_loop():
         with reservoir_lock:
             candidates = [{"ip": n["ip"], "country": n["country"], "ping": n.get("ping", 9999)} for n in global_node_reservoir.values() if n.get("ip") and not is_ip_blacklisted(n["ip"])]
         candidates.sort(key=lambda n: n["ping"])
-        payload = json.dumps({"ip": public_ip, "details": details, "log": read_recent_logs(), "candidates": candidates[:500]}).encode('utf-8')
+        payload = json.dumps({"ip": public_ip, "boot_id": BOOT_ID, "details": details, "log": read_recent_logs(), "candidates": candidates[:500]}).encode('utf-8')
         try:
             req = urllib.request.Request(f"{C2_URL}/api/report", data=payload, headers=get_c2_headers(), method='POST')
             urllib.request.urlopen(req, timeout=10)
@@ -1270,25 +1319,15 @@ systemctl is-active --quiet proxy-lite.service && echo "[+] 安全加固版部�
 
     // [6] API 接口区（鉴权已在顶部统一鉴权门完成，此处不再重复）
 
-    // [多机] Agent 拉配置：携带 ?ip=本机公网IP 时下发该 VPS 专属策略；否则走全局默认（兼容老版本 Agent）
+    // [多机] Agent 拉配置：携带 ?ip=本机公网IP[&boot=启动标识] 时下发该机器专属策略；
+    // 同一出口 IP 下多台机器各自独立行；否则走全局默认（兼容老版本 Agent）
     if (url.pathname === "/api/config" && request.method === "GET") {
         const g = await readGlobalConfig();
         const qip = (url.searchParams.get("ip") || "").trim();
         if (qip) {
-            await ensureServerConfig(qip);
-            const sc = await env.DB.prepare(`SELECT * FROM server_config WHERE ip = ?1`).bind(qip).first();
-            // [防误卸载] boot_id 变化 = 同一 IP 上全新重装：清除残留的卸载标记并记录新 boot_id，
-            // 避免新机器一上线就被旧的卸载指令干掉；老版本 Agent 不上报 boot 则保持原行为
-            const boot = (url.searchParams.get("boot") || "").trim().slice(0, 64);
-            if (sc && boot) {
-                if (sc.boot_id && sc.boot_id !== boot) {
-                    await env.DB.prepare(`UPDATE server_config SET pending_uninstall = 0, boot_id = ?2 WHERE ip = ?1`).bind(qip, boot).run();
-                    sc.pending_uninstall = 0; sc.boot_id = boot;
-                } else if (!sc.boot_id) {
-                    await env.DB.prepare(`UPDATE server_config SET boot_id = ?2 WHERE ip = ?1`).bind(qip, boot).run();
-                    sc.boot_id = boot;
-                }
-            }
+            const qboot = cleanBootId(url.searchParams.get("boot"));
+            const qkey = await ensureServerConfig(qip, qboot);
+            const sc = await env.DB.prepare(`SELECT * FROM server_config WHERE node_key = ?1`).bind(qkey).first();
             let slot_map = g.slot_map, force_switch = g.force_switch, mode = g.mode,
                 manual_node_ip = g.manual_node_ip, youtube_check = g.youtube_check, uninstall = false;
             if (sc) {
@@ -1390,61 +1429,72 @@ systemctl is-active --quiet proxy-lite.service && echo "[+] 安全加固版部�
     }
 
     // ====================================================
-    // [多机] 单 VPS 专属策略读写（面板用）
+    // [多机] 单节点专属策略读写（面板用）：以 node(ip 或 ip|boot_id) 标识节点
     // ====================================================
+    const reqNodeKey = (data) => {
+      const node = String(data.node || '').trim();
+      if (node) return node;
+      const ip = String(data.ip || '').trim();
+      return nodeKeyOf(ip, data.boot_id);
+    };
+
     if (url.pathname === "/api/server/config" && request.method === "GET") {
-        const qip = (url.searchParams.get("ip") || "").trim();
-        if (!qip) return new Response("missing ip", { status: 400 });
-        await ensureServerConfig(qip);
-        const sc = await env.DB.prepare(`SELECT * FROM server_config WHERE ip = ?1`).bind(qip).first();
+        const qkey = ((url.searchParams.get("node") || url.searchParams.get("ip") || "").trim());
+        if (!qkey) return new Response("missing node", { status: 400 });
+        const [qIp, qBoot] = splitNodeKey(qkey);
+        await ensureServerConfig(qIp, qBoot);
+        const sc = await env.DB.prepare(`SELECT * FROM server_config WHERE node_key = ?1`).bind(qkey).first();
         let country = "JP";
         try { const m = JSON.parse(sc.slot_map || '{"0":"JP"}'); country = (m[0] || m["0"] || "JP"); } catch (e) {}
-        return jsonRes({ ip: qip, country, mode: sc.mode === 'manual' ? 'manual' : 'auto',
+        return jsonRes({ node: qkey, ip: qIp, country, mode: sc.mode === 'manual' ? 'manual' : 'auto',
             manual_node_ip: sc.manual_node_ip || '', youtube_check: sc.youtube_check === 'true',
             pending_uninstall: sc.pending_uninstall === 1 });
     }
 
     if (url.pathname === "/api/server/config" && request.method === "POST") {
         const data = await request.json();
-        const ip = String(data.ip || "").trim();
+        const nkey = reqNodeKey(data);
         const country = (String(data.country || "JP").toUpperCase().trim() || "JP").slice(0, 4);
         const mode = data.mode === 'manual' ? 'manual' : 'auto';
         const manualNodeIp = String(data.manual_node_ip || "").trim();
         const youtubeCheck = data.youtube_check === true;
-        if (!ip) return new Response("missing ip", { status: 400 });
+        if (!nkey) return new Response("missing node", { status: 400 });
         if (mode === 'manual' && !manualNodeIp) return new Response("manual mode requires a node ip", { status: 400 });
-        await ensureServerConfig(ip);
-        await env.DB.prepare(`UPDATE server_config SET slot_map = ?2, mode = ?3, manual_node_ip = ?4, youtube_check = ?5 WHERE ip = ?1`)
-            .bind(ip, JSON.stringify({0: country}), mode, manualNodeIp, String(youtubeCheck)).run();
+        const [nIp, nBoot] = splitNodeKey(nkey);
+        await ensureServerConfig(nIp, nBoot);
+        await env.DB.prepare(`UPDATE server_config SET slot_map = ?2, mode = ?3, manual_node_ip = ?4, youtube_check = ?5 WHERE node_key = ?1`)
+            .bind(nkey, JSON.stringify({0: country}), mode, manualNodeIp, String(youtubeCheck)).run();
         return new Response("OK");
     }
 
-    // [多机] 单 VPS 强制换 IP
+    // [多机] 单节点强制换 IP
     if (url.pathname === "/api/server/switch" && request.method === "POST") {
         const data = await request.json();
-        const ip = String(data.ip || "").trim();
-        if (!ip) return new Response("missing ip", { status: 400 });
-        await ensureServerConfig(ip);
-        const sc = await env.DB.prepare(`SELECT force_switch FROM server_config WHERE ip = ?1`).bind(ip).first();
+        const nkey = reqNodeKey(data);
+        if (!nkey) return new Response("missing node", { status: 400 });
+        const [nIp, nBoot] = splitNodeKey(nkey);
+        await ensureServerConfig(nIp, nBoot);
+        const sc = await env.DB.prepare(`SELECT force_switch FROM server_config WHERE node_key = ?1`).bind(nkey).first();
         let fs = {};
         try { fs = JSON.parse((sc && sc.force_switch) || "{}"); } catch (e) {}
         fs["0"] = Date.now();
-        await env.DB.prepare(`UPDATE server_config SET force_switch = ?2 WHERE ip = ?1`).bind(ip, JSON.stringify(fs)).run();
+        await env.DB.prepare(`UPDATE server_config SET force_switch = ?2 WHERE node_key = ?1`).bind(nkey, JSON.stringify(fs)).run();
         return new Response("OK");
     }
 
-    // [多机] 删除 VPS：uninstall=下发远程卸载指令（Agent 自清理后注销）；force=仅删除面板记录
+    // [多机] 删除节点：uninstall=下发远程卸载指令（Agent 自清理后注销）；force=仅删除面板记录
     if (url.pathname === "/api/server/remove" && request.method === "POST") {
         const data = await request.json();
-        const ip = String(data.ip || "").trim();
+        const nkey = reqNodeKey(data);
         const mode = data.mode === "force" ? "force" : "uninstall";
-        if (!ip) return new Response("missing ip", { status: 400 });
+        if (!nkey) return new Response("missing node", { status: 400 });
         if (mode === "force") {
-            await env.DB.prepare(`DELETE FROM servers WHERE ip = ?1`).bind(ip).run();
-            await env.DB.prepare(`DELETE FROM server_config WHERE ip = ?1`).bind(ip).run();
+            await env.DB.prepare(`DELETE FROM servers WHERE node_key = ?1`).bind(nkey).run();
+            await env.DB.prepare(`DELETE FROM server_config WHERE node_key = ?1`).bind(nkey).run();
         } else {
-            await ensureServerConfig(ip);
-            await env.DB.prepare(`UPDATE server_config SET pending_uninstall = 1 WHERE ip = ?1`).bind(ip).run();
+            const [nIp, nBoot] = splitNodeKey(nkey);
+            await ensureServerConfig(nIp, nBoot);
+            await env.DB.prepare(`UPDATE server_config SET pending_uninstall = 1 WHERE node_key = ?1`).bind(nkey).run();
         }
         return new Response("OK");
     }
@@ -1453,30 +1503,43 @@ systemctl is-active --quiet proxy-lite.service && echo "[+] 安全加固版部�
     if (url.pathname === "/api/server/uninstalled" && request.method === "POST") {
         let data = {};
         try { data = await request.json(); } catch (e) {}
-        const ip = String(data.ip || "").trim();
-        if (!ip) return new Response("missing ip", { status: 400 });
-        await env.DB.prepare(`DELETE FROM servers WHERE ip = ?1`).bind(ip).run();
-        await env.DB.prepare(`DELETE FROM server_config WHERE ip = ?1`).bind(ip).run();
+        const nkey = reqNodeKey(data);
+        if (!nkey) return new Response("missing node", { status: 400 });
+        await env.DB.prepare(`DELETE FROM servers WHERE node_key = ?1`).bind(nkey).run();
+        await env.DB.prepare(`DELETE FROM server_config WHERE node_key = ?1`).bind(nkey).run();
         return new Response("OK");
     }
 
     if (url.pathname === "/api/report" && request.method === "POST") {
       try {
         const data = await request.json();
+        const rip = String(data.ip || '').trim();
+        const rboot = cleanBootId(data.boot_id);
+        const rkey = nodeKeyOf(rip, rboot);
         await env.DB.prepare(`
-          INSERT INTO servers (ip, details, log, candidates, last_seen) VALUES (?1, ?2, ?3, ?4, ?5)
-          ON CONFLICT(ip) DO UPDATE SET details = excluded.details, log = excluded.log, candidates = excluded.candidates, last_seen = excluded.last_seen
-        `).bind(data.ip, JSON.stringify(data.details || []), String(data.log || '').slice(-12000), JSON.stringify(data.candidates || []).slice(0, 100000), Date.now()).run();
-        // [多机] 新纳管 VPS 自动生成专属配置行（默认继承全局策略）
-        if (data.ip) { try { await ensureServerConfig(String(data.ip)); } catch (e) {} }
+          INSERT INTO servers (ip, boot_id, node_key, details, log, candidates, last_seen) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+          ON CONFLICT(node_key) DO UPDATE SET ip = excluded.ip, boot_id = excluded.boot_id, details = excluded.details, log = excluded.log, candidates = excluded.candidates, last_seen = excluded.last_seen
+        `).bind(rip, rboot, rkey, JSON.stringify(data.details || []), String(data.log || '').slice(-12000), JSON.stringify(data.candidates || []).slice(0, 100000), Date.now()).run();
+        // [多机] 新纳管机器自动生成专属配置行（默认继承全局策略）
+        if (rip) { try { await ensureServerConfig(rip, rboot); } catch (e) {} }
+        // [多机] 同一出口 IP 下：已失联旧节点的残留卸载标记自动清除（重装场景），避免面板残留"卸载中"
+        if (rip) {
+          try {
+            await env.DB.prepare(`
+              UPDATE server_config SET pending_uninstall = 0
+              WHERE ip = ?1 AND node_key != ?2 AND pending_uninstall = 1
+                AND NOT EXISTS (SELECT 1 FROM servers s WHERE s.node_key = server_config.node_key AND s.last_seen > ?3)
+            `).bind(rip, rkey, Date.now() - 120000).run();
+          } catch (e) {}
+        }
         return new Response("OK", { status: 200 });
       } catch (err) { return new Response("Error", { status: 500 }); }
     }
 
     if (url.pathname === "/api/proxies") {
       const cutoff = Date.now() - 120000;
-      // [多机] 待远程卸载的 VPS 在注销前保留，避免误删导致卸载指令丢失
-      await env.DB.prepare(`DELETE FROM servers WHERE last_seen < ?1 AND NOT EXISTS (SELECT 1 FROM server_config sc WHERE sc.ip = servers.ip AND sc.pending_uninstall = 1)`).bind(cutoff).run();
+      // [多机] 待远程卸载的节点在注销前保留，避免误删导致卸载指令丢失
+      await env.DB.prepare(`DELETE FROM servers WHERE last_seen < ?1 AND NOT EXISTS (SELECT 1 FROM server_config sc WHERE sc.node_key = servers.node_key AND sc.pending_uninstall = 1)`).bind(cutoff).run();
       const { results } = await env.DB.prepare(`SELECT ip, details FROM servers`).all();
       let proxyList = [];
       if (results) {
@@ -1491,13 +1554,13 @@ systemctl is-active --quiet proxy-lite.service && echo "[+] 安全加固版部�
 
     if (url.pathname === "/api/nodes") {
       const cutoff = Date.now() - 120000;
-      // [多机] 待远程卸载的 VPS 在注销前保留，以便面板展示“卸载中”状态
-      await env.DB.prepare(`DELETE FROM servers WHERE last_seen < ?1 AND NOT EXISTS (SELECT 1 FROM server_config sc WHERE sc.ip = servers.ip AND sc.pending_uninstall = 1)`).bind(cutoff).run();
+      // [多机] 待远程卸载的节点在注销前保留，以便面板展示“卸载中”状态
+      await env.DB.prepare(`DELETE FROM servers WHERE last_seen < ?1 AND NOT EXISTS (SELECT 1 FROM server_config sc WHERE sc.node_key = servers.node_key AND sc.pending_uninstall = 1)`).bind(cutoff).run();
       const { results } = await env.DB.prepare(`
         SELECT s.*,
                sc.slot_map AS c_slot_map, sc.mode AS c_mode, sc.manual_node_ip AS c_manual_node_ip,
                sc.youtube_check AS c_youtube_check, sc.pending_uninstall AS c_pending_uninstall
-        FROM servers s LEFT JOIN server_config sc ON s.ip = sc.ip
+        FROM servers s LEFT JOIN server_config sc ON s.node_key = sc.node_key
         ORDER BY s.last_seen DESC`).all();
        return new Response(JSON.stringify((results || []).map(server => {
          let candidates = [];
@@ -1883,15 +1946,18 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyPort) => {
             ).join('');
         }
 
-        function cardHtml(s) {
+        function cardHtml(s, dupIp) {
             const cfg = s.cfg || {};
             const uninstalling = !!cfg.pending_uninstall;
             const mode = cfg.mode === 'manual' ? 'manual' : 'auto';
+            // 同一出口 IP 下多台机器时，用 boot_id 后 6 位区分显示
+            const nodeBadge = dupIp && s.boot_id
+                ? \`<span class="ml-2 px-1.5 py-0.5 rounded text-[10px] font-mono bg-violet-400/15 text-violet-300 border border-violet-400/30" title="同一出口 IP 下的多台机器，以启动标识区分">#\${esc(String(s.boot_id).slice(-6))}</span>\` : '';
             return \`
-            <div class="glass-card p-5 rounded-2xl border border-white/10 flex flex-col gap-4 \${uninstalling ? 'opacity-75' : ''}" data-ip="\${esc(s.ip)}">
+            <div class="glass-card p-5 rounded-2xl border border-white/10 flex flex-col gap-4 \${uninstalling ? 'opacity-75' : ''}" data-node="\${esc(s.node_key)}" data-ip="\${esc(s.ip)}">
                 <div class="flex items-start justify-between gap-3">
                     <div class="min-w-0">
-                        <div class="font-mono text-lg text-blue-300 break-all">\${esc(s.ip)}</div>
+                        <div class="font-mono text-lg text-blue-300 break-all">\${esc(s.ip)}\${nodeBadge}</div>
                         <div class="text-xs text-slate-500 mt-1" data-dyn="hb">心跳同步中…</div>
                     </div>
                     <div class="flex items-center gap-2 flex-shrink-0" data-dyn="badges"></div>
@@ -1985,26 +2051,30 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyPort) => {
         function syncVpsList(servers) {
             const list = document.getElementById('vps-list');
             const seen = new Set();
+            // 统计同一出口 IP 下的机器数，用于显示区分徽标
+            const ipCount = {};
+            (servers || []).forEach(s => { ipCount[s.ip] = (ipCount[s.ip] || 0) + 1; });
             (servers || []).forEach(s => {
-                seen.add(s.ip);
-                let card = list.querySelector('[data-ip="' + s.ip.replace(/"/g, '') + '"]');
+                const nkey = s.node_key || s.ip;
+                seen.add(nkey);
+                let card = list.querySelector('[data-node="' + String(nkey).replace(/"/g, '') + '"]');
                 const uninstalling = !!(s.cfg && s.cfg.pending_uninstall);
                 if (card && card._uninstalling !== uninstalling) { card.remove(); card = null; }
                 if (!card) {
                     const tmp = document.createElement('div');
-                    tmp.innerHTML = cardHtml(s);
+                    tmp.innerHTML = cardHtml(s, (ipCount[s.ip] || 0) > 1);
                     card = tmp.firstElementChild;
                     card._uninstalling = uninstalling;
                     list.appendChild(card);
                 }
                 updateCard(card, s);
             });
-            list.querySelectorAll('[data-ip]').forEach(card => { if (!seen.has(card.dataset.ip)) card.remove(); });
+            list.querySelectorAll('[data-node]').forEach(card => { if (!seen.has(card.dataset.node)) card.remove(); });
             document.getElementById('vps-count').textContent = (servers && servers.length) ? ('共 ' + servers.length + ' 台') : '';
             document.getElementById('vps-empty').classList.toggle('hidden', (servers && servers.length) > 0);
         }
 
-        async function saveServerPolicy(card, ip) {
+        async function saveServerPolicy(card, node, ip) {
             const country = ((card.querySelector('[data-field="country"]').value || 'JP').toUpperCase().trim() || 'JP');
             const mode = card.querySelector('[data-field="mode"]').value;
             const nodeIp = card.querySelector('[data-field="node"]').value;
@@ -2012,37 +2082,37 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyPort) => {
             if (mode === 'manual' && !nodeIp) { alert('手动模式请先选择一个 vpngate 节点'); return; }
             const res = await api('/api/server/config', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ ip, country, mode, manual_node_ip: nodeIp, youtube_check: yt })
+                body: JSON.stringify({ node, country, mode, manual_node_ip: nodeIp, youtube_check: yt })
             });
             if (!res.ok) { alert('策略保存失败，请重试'); return; }
-            pushLog(\`VPS [\${ip}] 策略已下发：\${country} / \${mode === 'manual' ? '手动节点 ' + nodeIp : '自动连接'}\`, 'SYS');
-            alert('策略已保存，将在该 VPS 下次同步时生效（约 15 秒内）。');
+            pushLog(\`节点 [\${ip}] 策略已下发：\${country} / \${mode === 'manual' ? '手动节点 ' + nodeIp : '自动连接'}\`, 'SYS');
+            alert('策略已保存，将在该节点下次同步时生效（约 15 秒内）。');
             fetchNodes();
         }
 
-        async function forceSwitchServer(ip) {
-            if (!confirm('确认强制断开 VPS [' + ip + '] 当前的隧道并换新 IP 吗？\\n（当前 IP 进入 1 分钟冷却）')) return;
+        async function forceSwitchServer(node, ip) {
+            if (!confirm('确认强制断开节点 [' + ip + '] 当前的隧道并换新 IP 吗？\\n（当前 IP 进入 1 分钟冷却）')) return;
             const res = await api('/api/server/switch', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ ip })
+                body: JSON.stringify({ node })
             });
             if (res.ok) {
-                pushLog(\`已向 VPS [\${ip}] 下发强制换 IP 指令\`, 'WARN');
-                alert('指令已下发，VPS 正在重拨…');
+                pushLog(\`已向节点 [\${ip}] 下发强制换 IP 指令\`, 'WARN');
+                alert('指令已下发，节点正在重拨…');
             } else alert('指令下发失败，请重试');
         }
 
-        async function removeServer(ip, mode) {
+        async function removeServer(node, ip, mode) {
             const res = await api('/api/server/remove', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ ip, mode })
+                body: JSON.stringify({ node, mode })
             });
             if (!res.ok) { alert('删除失败，请重试'); return; }
             if (mode === 'force') {
-                pushLog(\`已删除 VPS [\${ip}] 的面板记录（VPS 上残留文件需手动清理）\`, 'WARN');
+                pushLog(\`已删除节点 [\${ip}] 的面板记录（机器上残留文件需手动清理）\`, 'WARN');
             } else {
-                pushLog(\`已向 VPS [\${ip}] 下发远程卸载指令\`, 'WARN');
-                alert('远程卸载指令已下发，VPS 将在下次同步时自动清理并注销。');
+                pushLog(\`已向节点 [\${ip}] 下发远程卸载指令\`, 'WARN');
+                alert('远程卸载指令已下发，节点将在下次同步时自动清理并注销。');
             }
             fetchNodes();
         }
@@ -2050,28 +2120,29 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyPort) => {
         document.getElementById('vps-list').addEventListener('click', async (e) => {
             const btn = e.target.closest('[data-action]');
             if (!btn) return;
-            const card = btn.closest('[data-ip]');
+            const card = btn.closest('[data-node]');
             if (!card) return;
-            const ip = card.dataset.ip;
+            const node = card.dataset.node;
+            const ip = card.dataset.ip || node;
             const action = btn.dataset.action;
             const confirmBox = card.querySelector('[data-dyn="del-confirm"]');
             const actionsBox = card.querySelector('[data-dyn="actions"]');
             try {
-                if (action === 'save') await saveServerPolicy(card, ip);
-                else if (action === 'switch') await forceSwitchServer(ip);
+                if (action === 'save') await saveServerPolicy(card, node, ip);
+                else if (action === 'switch') await forceSwitchServer(node, ip);
                 else if (action === 'del') { if (confirmBox) confirmBox.classList.remove('hidden'); if (actionsBox) actionsBox.classList.add('hidden'); }
                 else if (action === 'del-cancel') { if (confirmBox) confirmBox.classList.add('hidden'); if (actionsBox) actionsBox.classList.remove('hidden'); }
-                else if (action === 'del-uninstall') await removeServer(ip, 'uninstall');
+                else if (action === 'del-uninstall') await removeServer(node, ip, 'uninstall');
                 else if (action === 'del-force') {
                     const fromConfirm = confirmBox && !confirmBox.classList.contains('hidden');
-                    if (!fromConfirm && !confirm('该 VPS 可能仍在运行代理程序，仅删除面板记录吗？\\n（VPS 上的文件需手动清理；如需自动清理请选择「远程卸载并删除」）')) return;
-                    await removeServer(ip, 'force');
+                    if (!fromConfirm && !confirm('该节点可能仍在运行代理程序，仅删除面板记录吗？\\n（机器上的文件需手动清理；如需自动清理请选择「远程卸载并删除」）')) return;
+                    await removeServer(node, ip, 'force');
                 }
             } catch (err) { alert('操作失败：' + (err.message || err)); }
         });
 
         document.getElementById('vps-list').addEventListener('change', (e) => {
-            const card = e.target.closest('[data-ip]');
+            const card = e.target.closest('[data-node]');
             if (!card) return;
             if (e.target.matches('[data-field="mode"]')) {
                 const nodeSel = card.querySelector('[data-field="node"]');
